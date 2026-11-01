@@ -1,0 +1,109 @@
+name: Checks (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      build_images:
+        description: Test-build the Docker images (skipped on deploy runs, which build them anyway)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # Dev extras only. No torch or FlagEmbedding: unit tests use fake gateways.
+      - name: Install dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Format check
+        run: ruff format --check .
+
+      - name: Type check
+        run: mypy app core
+
+      - name: Unit tests
+        run: pytest tests --cov=app --cov-report=term-missing
+
+  dockerfile-lint:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        file: [Dockerfile.admin, Dockerfile.ml]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: docker/${{ matrix.file }}
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Pin to a current release. Reads .gitleaks.toml from the repo root.
+      - name: Gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            detect --source /repo --redact --no-banner --verbose
+
+  build-images:
+    if: ${{ inputs.build_images }}
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [admin, ml]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The torch images are large; free the runner's disk first
+      - name: Free disk space
+        if: matrix.image != 'admin'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.image }} (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.${{ matrix.image }}
+          push: false
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.image }}
+
+  # One job to require in branch protection
+  all-checks:
+    if: always()
+    needs: [lint-and-test, dockerfile-lint, secret-scan, build-images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any job failed or was cancelled
+        run: |
+          if [ "${{ contains(needs.*.result, 'failure') }}" = "true" ] || \
+             [ "${{ contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "One or more checks failed"
+            exit 1
+          fi

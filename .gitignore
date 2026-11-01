@@ -1,0 +1,55 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+ENV/
+
+# ---------- Secrets and environment ----------
+.env
+.env.*
+env/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ---------- Tooling caches ----------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ---------- IDE / OS ----------
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---------- Logs and temp ----------
+*.log
+logs/
+tmp/
+celerybeat-schedule*
+
+# ---------- Local data and models ----------
+data/*
+!data/nepal_laws_data/
+data/nepal_laws_data/*
+!data/nepal_laws_data/.gitkeep
+models/
+.cache/
+.huggingface/
+
+# ---------- Local docker volumes ----------
+docker/volumes/
+mongo_data/
+qdrant_storage/
+ollama_data/
+docker-compose.override.yml

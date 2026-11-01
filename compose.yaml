@@ -1,0 +1,10 @@
+# Local shortcut: lets a plain `docker compose up --build` work from the project root.
+# Same stack as `make up`. Servers do not use this file (see the Makefile).
+name: nlr-local
+
+include:
+  - path:
+      - docker/docker-compose.yml
+      - docker/docker-compose.dev.yml
+    project_directory: docker
+    env_file: env/local/infra.env

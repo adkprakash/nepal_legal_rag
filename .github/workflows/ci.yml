@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, staging, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    uses: ./.github/workflows/_checks.yml
+    with:
+      build_images: true
+
+  # Enforces develop -> staging -> main. Hotfix branches may go straight to main.
+  promotion-guard:
+    runs-on: ubuntu-latest
+    env:
+      BASE: ${{ github.base_ref }}
+      HEAD: ${{ github.head_ref }}
+    steps:
+      - name: Check the source branch
+        run: |
+          case "$BASE" in
+            develop)
+              exit 0 ;;
+            staging)
+              [[ "$HEAD" == "develop" || "$HEAD" == hotfix/* ]] && exit 0 ;;
+            main)
+              [[ "$HEAD" == "staging" || "$HEAD" == hotfix/* ]] && exit 0 ;;
+          esac
+          echo "::error::A PR into '$BASE' may not come from '$HEAD'. Promote develop -> staging -> main."
+          exit 1

@@ -1,0 +1,196 @@
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+# Same values for both services, straight from infra.env
+x-shared-contract: &shared-contract
+  APP_ENV: ${APP_ENV:?set in infra.env}
+  MONGO_DB_NAME: ${MONGO_DB_NAME:?set in infra.env}
+  QDRANT_COLLECTION: ${QDRANT_COLLECTION:?set in infra.env}
+  QDRANT_DENSE_VECTOR_NAME: ${QDRANT_DENSE_VECTOR_NAME:?set in infra.env}
+  QDRANT_SPARSE_VECTOR_NAME: ${QDRANT_SPARSE_VECTOR_NAME:?set in infra.env}
+  EMBEDDING_MODEL: ${EMBEDDING_MODEL:?set in infra.env}
+  EMBEDDING_DIM: ${EMBEDDING_DIM:?set in infra.env}
+
+services:
+
+  # ---------------- Infrastructure ----------------
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:?}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:?}
+      MONGO_DB_NAME: ${MONGO_DB_NAME:?}
+      MONGO_ADMIN_RW_PASSWORD: ${MONGO_ADMIN_RW_PASSWORD:?}
+      MONGO_USER_APP_PASSWORD: ${MONGO_USER_APP_PASSWORD:?}
+    volumes:
+      - mongo_data:/data/db
+      - ./mongo/init_indexes.js:/docker-entrypoint-initdb.d/init_indexes.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [backend]
+
+  qdrant:
+    image: qdrant/qdrant:${QDRANT_VERSION:-v1.12.4}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:?}
+      QDRANT__SERVICE__READ_ONLY_API_KEY: ${QDRANT_READ_ONLY_API_KEY:?}
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [backend]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  ollama:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.35.1}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-24h}
+      OLLAMA_MAX_LOADED_MODELS: ${OLLAMA_MAX_LOADED_MODELS:-1}
+      OLLAMA_NUM_PARALLEL: ${OLLAMA_NUM_PARALLEL:-2}
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks: [backend]
+
+  # One-shot: pulls the model into the ollama volume, then exits
+  ollama_init:
+    image: ollama/ollama:${OLLAMA_VERSION:-0.35.1}
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull ${OLLAMA_MODEL:?set in infra.env}"]
+    networks: [backend]
+
+  # ---------------- Admin side ----------------
+  admin_api:
+    image: ghcr.io/${IMAGE_REPO:-local/nepal-legal-rag}-admin:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file: ../env/${APP_ENV:?}/admin.env
+    environment:
+      <<: *shared-contract
+      MONGO_URI: mongodb://admin_rw:${MONGO_ADMIN_RW_PASSWORD:?}@mongo:27017/${MONGO_DB_NAME}?authSource=${MONGO_DB_NAME}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+    ports:
+      - "${ADMIN_API_BIND:-127.0.0.1}:${ADMIN_API_HOST_PORT:-8001}:8001"
+    depends_on:
+      mongo:  { condition: service_healthy }
+      qdrant: { condition: service_healthy }
+      redis:  { condition: service_healthy }
+    networks: [backend]
+
+  worker:
+    # Same image as user_api, started as the Celery worker
+    image: ghcr.io/${IMAGE_REPO:-local/nepal-legal-rag}-ml:${IMAGE_TAG:-latest}
+    command: ["sh", "-c", "celery -A core.celery.app:celery_app worker --loglevel=$${LOG_LEVEL:-INFO} --concurrency=$${CELERY_WORKER_CONCURRENCY:-1}"]
+    restart: unless-stopped
+    logging: *logging
+    env_file: ../env/${APP_ENV:?}/admin.env
+    environment:
+      <<: *shared-contract
+      MONGO_URI: mongodb://admin_rw:${MONGO_ADMIN_RW_PASSWORD:?}@mongo:27017/${MONGO_DB_NAME}?authSource=${MONGO_DB_NAME}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/2
+    volumes:
+      - hf_cache:/models/huggingface
+    # Let a running ingestion finish before the container is killed
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A core.celery.app:celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 || exit 1"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 240s
+    depends_on:
+      mongo:  { condition: service_healthy }
+      qdrant: { condition: service_healthy }
+      redis:  { condition: service_healthy }
+    networks: [backend]
+
+  # ---------------- User side ----------------
+  user_api:
+    image: ghcr.io/${IMAGE_REPO:-local/nepal-legal-rag}-ml:${IMAGE_TAG:-latest}
+    # One process: each uvicorn worker would load its own copy of the models
+    command: ["uvicorn", "main_user:app", "--host", "0.0.0.0", "--port", "8002"]
+    # Long start period: first boot downloads the models into the hf_cache volume
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 240s
+    restart: unless-stopped
+    logging: *logging
+    env_file: ../env/${APP_ENV:?}/user.env
+    environment:
+      <<: *shared-contract
+      MONGO_URI: mongodb://user_app:${MONGO_USER_APP_PASSWORD:?}@mongo:27017/${MONGO_DB_NAME}?authSource=${MONGO_DB_NAME}
+      # The read-only key, presented to the app under the usual name
+      QDRANT_API_KEY: ${QDRANT_READ_ONLY_API_KEY:?}
+      REDIS_URL: redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      LLM_MODEL: ${OLLAMA_MODEL:?}
+    volumes:
+      - hf_cache:/models/huggingface
+    ports:
+      - "${USER_API_BIND:-0.0.0.0}:${USER_API_HOST_PORT:-8002}:8002"
+    depends_on:
+      mongo:       { condition: service_healthy }
+      qdrant:      { condition: service_healthy }
+      redis:       { condition: service_healthy }
+      ollama_init: { condition: service_completed_successfully }
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  mongo_data:
+  qdrant_storage:
+  redis_data:
+  ollama_data:
+  hf_cache:

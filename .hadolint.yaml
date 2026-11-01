@@ -1,0 +1,5 @@
+failure-threshold: warning
+ignored:
+  - DL3008   # apt package versions
+  - DL3013   # pip versions (pinned through the lock file)
+  - DL3042   # pip cache flag (PIP_NO_CACHE_DIR is set)

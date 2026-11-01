@@ -1,0 +1,97 @@
+name: Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app_env:
+        description: develop | staging | production
+        type: string
+        required: true
+      image_tag:
+        description: Full 40-character commit SHA
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Environment secrets, variables and required reviewers apply here
+    environment: ${{ inputs.app_env }}
+    concurrency:
+      group: deploy-${{ inputs.app_env }}
+      cancel-in-progress: false
+    env:
+      APP_ENV: ${{ inputs.app_env }}
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/nepal-legal-rag' }}
+      USE_GPU: ${{ vars.USE_GPU || 'true' }}
+      SSH_PORT: ${{ vars.SSH_PORT || '22' }}
+    steps:
+      - name: Validate inputs
+        run: |
+          case "$APP_ENV" in
+            develop|staging|production) ;;
+            *) echo "::error::Unknown environment '$APP_ENV'"; exit 1 ;;
+          esac
+          [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "::error::image_tag must be a full 40-character commit SHA"; exit 1; }
+
+      # Same commit as the images, so compose files and Makefile match what is deployed
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.image_tag }}
+
+      - name: Configure SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host target
+            HostName ${SSH_HOST}
+            User ${SSH_USER}
+            Port ${SSH_PORT}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+          EOF
+
+      # Only compose files and the Makefile travel. Real .env files stay on the server.
+      - name: Upload release files
+        run: |
+          tar czf "$RUNNER_TEMP/release.tgz" docker Makefile
+          scp "$RUNNER_TEMP/release.tgz" "target:/tmp/nlr-${APP_ENV}-${IMAGE_TAG}.tgz"
+
+      # Variables and the registry token go through stdin, never the command line
+      - name: Deploy on the server
+        env:
+          GHCR_PULL_USER: ${{ secrets.GHCR_PULL_USER }}
+          GHCR_PULL_TOKEN: ${{ secrets.GHCR_PULL_TOKEN }}
+        run: |
+          {
+            printf 'export APP_ENV=%q IMAGE_TAG=%q DEPLOY_PATH=%q USE_GPU=%q\n' \
+              "$APP_ENV" "$IMAGE_TAG" "$DEPLOY_PATH" "$USE_GPU"
+            printf 'export GHCR_PULL_USER=%q GHCR_PULL_TOKEN=%q\n' \
+              "$GHCR_PULL_USER" "$GHCR_PULL_TOKEN"
+            sed 's/\r$//' scripts/remote_deploy.sh
+          } | ssh target 'bash -s'
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy: \`${APP_ENV}\`"
+            echo "- Release: \`${IMAGE_TAG}\`"
+            echo "- Result: \`${{ job.status }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

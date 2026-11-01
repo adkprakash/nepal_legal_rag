@@ -1,0 +1,19 @@
+# Server overlay: give the model-running services the NVIDIA GPU.
+# Needs the NVIDIA driver and Container Toolkit on the host.
+x-gpu: &gpu
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: all
+          capabilities: [gpu]
+
+services:
+  ollama:
+    deploy: *gpu
+
+  worker:
+    deploy: *gpu
+
+  user_api:
+    deploy: *gpu

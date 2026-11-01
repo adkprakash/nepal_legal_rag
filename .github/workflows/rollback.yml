@@ -1,0 +1,25 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_env:
+        description: Environment to roll back (run this workflow from the matching branch)
+        type: choice
+        options: [develop, staging, production]
+        required: true
+      image_tag:
+        description: Full 40-character commit SHA of an earlier release
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  rollback:
+    uses: ./.github/workflows/_deploy.yml
+    with:
+      app_env: ${{ inputs.app_env }}
+      image_tag: ${{ inputs.image_tag }}
+    secrets: inherit

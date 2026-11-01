@@ -1,0 +1,20 @@
+# Local overlay: build the images from source, CPU-only PyTorch.
+# Paths are relative to docker/ (the directory of the first compose file).
+x-ml-build: &ml-build
+  context: ..
+  dockerfile: docker/Dockerfile.ml
+  args:
+    TORCH_INDEX_URL: https://download.pytorch.org/whl/cpu
+
+services:
+  admin_api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.admin
+
+  # worker and user_api share one image, so it is built and stored once
+  worker:
+    build: *ml-build
+
+  user_api:
+    build: *ml-build
